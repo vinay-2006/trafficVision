@@ -23,6 +23,7 @@ from typing import Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form
 from fastapi.responses import FileResponse, JSONResponse
 
+from src.perspective import PerspectiveTransformer
 from src.pipeline import TrafficPipeline
 from src.reporting import ReportGenerator
 
@@ -33,6 +34,46 @@ app = FastAPI(
 )
 
 WEIGHTS_PATH = "yolo11n.pt"
+MAX_UPLOAD_BYTES = 300 * 1024 * 1024  # 300 MB limit
+
+
+def _validate_and_save_upload(video: UploadFile) -> str:
+    if not video.filename or not video.filename.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
+        raise HTTPException(status_code=400, detail="Upload a .mp4, .avi, or .mov video file")
+
+    suffix = Path(video.filename).suffix
+    total_bytes = 0
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp_vid:
+        while True:
+            chunk = video.file.read(1024 * 1024)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            if total_bytes > MAX_UPLOAD_BYTES:
+                tmp_vid.close()
+                Path(tmp_vid.name).unlink(missing_ok=True)
+                raise HTTPException(status_code=413, detail="Video exceeds maximum allowed upload size (300 MB)")
+            tmp_vid.write(chunk)
+        return tmp_vid.name
+
+
+def _validate_and_save_calibration(calibration: Optional[UploadFile]) -> Optional[str]:
+    if calibration is None or not hasattr(calibration, "file") or not getattr(calibration, "filename", None):
+        return None
+
+    try:
+        calib_bytes = calibration.file.read()
+        calib_data = json.loads(calib_bytes.decode("utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Malformed calibration JSON: {str(e)}")
+
+    valid, msg, _ = PerspectiveTransformer.validate_calibration_dict(calib_data)
+    if not valid:
+        raise HTTPException(status_code=400, detail=f"Invalid calibration JSON: {msg}")
+
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp_cal:
+        tmp_cal.write(calib_bytes)
+        return tmp_cal.name
 
 
 @app.get("/health")
@@ -52,21 +93,16 @@ def analyze(
     conf: float = 0.35,
     frame_skip: int = 1,
 ):
-    if not video.filename or not video.filename.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
-        raise HTTPException(status_code=400, detail="Upload a .mp4, .avi, or .mov video file")
+    if not (0.05 <= conf <= 0.95):
+        raise HTTPException(status_code=400, detail="Confidence threshold must be between 0.05 and 0.95")
+    if not (1 <= frame_skip <= 30):
+        raise HTTPException(status_code=400, detail="Frame skip must be an integer between 1 and 30")
 
-    suffix = Path(video.filename).suffix
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp_vid:
-        shutil.copyfileobj(video.file, tmp_vid)
-        video_path = tmp_vid.name
-
+    video_path = _validate_and_save_upload(video)
     calib_path = None
-    if calibration is not None and hasattr(calibration, "file") and getattr(calibration, "filename", None):
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp_cal:
-            shutil.copyfileobj(calibration.file, tmp_cal)
-            calib_path = tmp_cal.name
 
     try:
+        calib_path = _validate_and_save_calibration(calibration)
         pipeline = TrafficPipeline(
             weights=WEIGHTS_PATH,
             conf=conf,
@@ -75,7 +111,6 @@ def analyze(
         )
         result = pipeline.process_video(video_path, generate_annotated_video=False)
 
-        # Retain backward compatibility with earlier endpoint keys while adding new intelligence
         response_payload = {
             "frames_processed": result["frames_processed"],
             "vehicles_in": result["vehicle_counts"]["vehicles_in"],
@@ -84,6 +119,7 @@ def analyze(
             "max_speed_kmh_per_track": result["speed_statistics"]["per_track_max_speed"],
             "detection_class_counts": result["vehicle_counts"]["class_distribution"],
             "calibration_used": result["speed_statistics"]["is_calibrated"],
+            "calibration_status": result["speed_statistics"]["calibration_status"],
             "speed_warning": result["speed_statistics"]["speed_warning"],
             "speed_statistics": result["speed_statistics"],
             "congestion_statistics": result["congestion_statistics"],
@@ -94,6 +130,8 @@ def analyze(
             "processing_fps": result["processing_fps"],
         }
         return JSONResponse(content=response_payload)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Pipeline processing failed: {str(e)}")
     finally:
@@ -110,23 +148,19 @@ def analyze_video(
     conf: float = 0.35,
     frame_skip: int = 1,
 ):
-    if not video.filename or not video.filename.lower().endswith((".mp4", ".avi", ".mov", ".mkv")):
-        raise HTTPException(status_code=400, detail="Upload a .mp4, .avi, or .mov video file")
+    if not (0.05 <= conf <= 0.95):
+        raise HTTPException(status_code=400, detail="Confidence threshold must be between 0.05 and 0.95")
+    if not (1 <= frame_skip <= 30):
+        raise HTTPException(status_code=400, detail="Frame skip must be an integer between 1 and 30")
 
-    suffix = Path(video.filename).suffix
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp_vid:
-        shutil.copyfileobj(video.file, tmp_vid)
-        video_path = tmp_vid.name
-
+    video_path = _validate_and_save_upload(video)
     calib_path = None
-    if calibration is not None and hasattr(calibration, "file") and getattr(calibration, "filename", None):
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp_cal:
-            shutil.copyfileobj(calibration.file, tmp_cal)
-            calib_path = tmp_cal.name
 
-    out_annotated = tempfile.mktemp(suffix=".mp4")
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_out:
+        out_annotated = tmp_out.name
 
     try:
+        calib_path = _validate_and_save_calibration(calibration)
         pipeline = TrafficPipeline(
             weights=WEIGHTS_PATH,
             conf=conf,
@@ -143,6 +177,12 @@ def analyze_video(
 
         background_tasks.add_task(cleanup)
         return FileResponse(out_annotated, media_type="video/mp4", filename=f"annotated_{Path(video.filename).stem}.mp4")
+    except HTTPException:
+        Path(video_path).unlink(missing_ok=True)
+        if calib_path:
+            Path(calib_path).unlink(missing_ok=True)
+        Path(out_annotated).unlink(missing_ok=True)
+        raise
     except Exception as e:
         Path(video_path).unlink(missing_ok=True)
         if calib_path:

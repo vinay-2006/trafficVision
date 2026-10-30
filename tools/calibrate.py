@@ -103,6 +103,9 @@ def main():
     width_m = float(input("Real-world WIDTH of that rectangle, in meters (e.g. lane width): "))
     length_m = float(input("Real-world LENGTH of that rectangle, in meters (e.g. distance between the two marked lines): "))
 
+    if width_m <= 0.2 or length_m <= 0.2:
+        raise ValueError(f"Rectangle dimensions must be positive physical numbers (width={width_m}m, length={length_m}m)")
+
     target_points = np.array([
         [0, 0],
         [width_m, 0],
@@ -110,7 +113,14 @@ def main():
         [0, length_m],
     ], dtype=np.float32)
 
-    transformer = PerspectiveTransformer(source_points, target_points)
+    transformer = PerspectiveTransformer(
+        source_points,
+        target_points,
+        is_calibrated=True,
+        status="calibrated",
+        provenance="measured_user",
+        validation_message=f"Measured ground truth: width={width_m:.2f}m, length={length_m:.2f}m",
+    )
     transformer.to_json(args.output)
 
     print(f"\nSaved calibration to {args.output}")

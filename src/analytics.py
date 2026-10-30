@@ -5,6 +5,7 @@ Downstream analytics built on top of tracked detections:
   - directional traffic analysis (incoming vs outgoing)
 """
 from collections import defaultdict, deque
+import math
 from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -19,39 +20,55 @@ class SpeedEstimator:
         transformer: PerspectiveTransformer,
         fps: float,
         window_seconds: float = 1.0,
-        max_speed_kmh: float = 240.0,
+        max_speed_kmh: float = 200.0,
         ema_alpha: float = 0.4,
+        max_gap_seconds: float = 1.5,
     ):
         """
         Args:
-            transformer: maps pixel -> real-world meter coordinates
-            fps: video frame rate
-            window_seconds: duration of position history window
-            max_speed_kmh: ceiling for physically plausible speed on highway/city
-            ema_alpha: smoothing factor for Exponential Moving Average
+            transformer: maps pixel -> real-world meter coordinates.
+            fps: video frame rate.
+            window_seconds: duration of position history window.
+            max_speed_kmh: threshold above which speeds are marked as outliers.
+            ema_alpha: smoothing factor for Exponential Moving Average.
+            max_gap_seconds: max time gap before considering a track discontinuous.
         """
         self.transformer = transformer
         self.fps = float(fps) if fps > 0 else 25.0
-        self.is_calibrated = getattr(transformer, "is_calibrated", True)
+        self.is_calibrated = getattr(transformer, "is_calibrated", False)
+        self.calibration_status = getattr(transformer, "status", "illustrative")
         self.window_size = max(2, int(window_seconds * self.fps))
-        self.max_speed_kmh = max_speed_kmh
-        self.ema_alpha = ema_alpha
+        self.max_speed_kmh = float(max_speed_kmh)
+        self.ema_alpha = float(ema_alpha)
+        self.max_gap_frames = max(2, int(max_gap_seconds * self.fps))
 
         # tracker_id -> deque of (frame_idx, x_m, y_m)
         self.history: Dict[int, Deque[Tuple[int, float, float]]] = defaultdict(
             lambda: deque(maxlen=self.window_size)
         )
-        # tracker_id -> latest smoothed speed km/h
+        # tracker_id -> last observed frame index (for discontinuity detection)
+        self.last_seen_frame: Dict[int, int] = {}
+
+        # tracker_id -> latest smoothed reliable speed km/h
         self.latest_speeds: Dict[int, float] = {}
-        # tracker_id -> list of (frame_idx, speed_kmh)
+        # tracker_id -> list of reliable (frame_idx, speed_kmh)
         self.speed_history: Dict[int, List[Tuple[int, float]]] = defaultdict(list)
-        # tracker_id -> max observed speed
+        # tracker_id -> max reliable observed speed
         self.max_speeds: Dict[int, float] = {}
+
+        # Raw diagnostic measurements (for audit, inspection, debugging)
+        # tracker_id -> list of dicts with raw measurements and outlier flags
+        self.raw_diagnostics: Dict[int, List[Dict]] = defaultdict(list)
+        self.outliers_count = 0
+
+    @property
+    def outlier_count(self) -> int:
+        return self.outliers_count
 
     def update(self, detections: sv.Detections, frame_idx: int) -> Dict[int, float]:
         """Feed current-frame tracked detections, get back
-        {tracker_id: speed_kmh} for tracks with sufficient history."""
-        if detections.tracker_id is None or len(detections.tracker_id) == 0:
+        {tracker_id: speed_kmh} for tracks with valid, non-outlier history."""
+        if detections is None or detections.tracker_id is None or len(detections.tracker_id) == 0:
             return {}
 
         anchor_points = detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
@@ -60,26 +77,63 @@ class SpeedEstimator:
         current_frame_speeds: Dict[int, float] = {}
         for tracker_id, (x_m, y_m) in zip(detections.tracker_id, ground_points):
             tid = int(tracker_id)
-            self.history[tid].append((frame_idx, float(x_m), float(y_m)))
+            xm, ym = float(x_m), float(y_m)
+
+            # Check track discontinuity: if track reappears after a large frame gap,
+            # reset history so we do not measure false jumps across missing periods
+            if tid in self.last_seen_frame:
+                gap = frame_idx - self.last_seen_frame[tid]
+                if gap > self.max_gap_frames:
+                    self.history[tid].clear()
+
+            self.last_seen_frame[tid] = frame_idx
+            self.history[tid].append((frame_idx, xm, ym))
             hist = self.history[tid]
 
             if len(hist) >= 2:
                 (f0, x0, y0), (f1, x1, y1) = hist[0], hist[-1]
-                dt = (f1 - f0) / self.fps
+                elapsed_frames = f1 - f0
+                dt = elapsed_frames / self.fps
+
                 if dt > 0:
                     dist_m = float(np.hypot(x1 - x0, y1 - y0))
                     raw_speed_mps = dist_m / dt
                     raw_speed_kmh = raw_speed_mps * 3.6
 
-                    # Clamp to realistic physical range
-                    clamped_kmh = min(raw_speed_kmh, self.max_speed_kmh)
+                    is_outlier = False
+                    outlier_reason = None
 
-                    # Smooth using EMA
+                    # Check finite numbers
+                    if not math.isfinite(raw_speed_kmh) or raw_speed_kmh < 0.0:
+                        is_outlier = True
+                        outlier_reason = "non_finite_or_negative"
+                    elif raw_speed_kmh > self.max_speed_kmh:
+                        is_outlier = True
+                        outlier_reason = f"exceeds_plausible_max_{self.max_speed_kmh}kmh"
+
+                    # Record raw diagnostic measurement
+                    diag = {
+                        "frame_idx": frame_idx,
+                        "dt_sec": round(dt, 4),
+                        "dist_m": round(dist_m, 3),
+                        "raw_kmh": round(raw_speed_kmh, 2) if math.isfinite(raw_speed_kmh) else None,
+                        "is_outlier": is_outlier,
+                        "outlier_reason": outlier_reason,
+                    }
+                    self.raw_diagnostics[tid].append(diag)
+
+                    if is_outlier:
+                        self.outliers_count += 1
+                        # DO NOT clamp silently into reliable statistics!
+                        # Outlier speeds are excluded from reliable summary stats.
+                        continue
+
+                    # Apply EMA smoothing on valid, physically plausible measurements
                     if tid in self.latest_speeds:
                         prev = self.latest_speeds[tid]
-                        smoothed = self.ema_alpha * clamped_kmh + (1.0 - self.ema_alpha) * prev
+                        smoothed = self.ema_alpha * raw_speed_kmh + (1.0 - self.ema_alpha) * prev
                     else:
-                        smoothed = clamped_kmh
+                        smoothed = raw_speed_kmh
 
                     self.latest_speeds[tid] = smoothed
                     self.speed_history[tid].append((frame_idx, smoothed))
@@ -100,21 +154,29 @@ class SpeedEstimator:
             return 0.0
         return float(np.mean([s for _, s in records]))
 
-    def get_summary_stats(self) -> Dict[str, float]:
-        """Global speed summary across all recorded tracks."""
-        if not self.max_speeds:
+    def get_raw_diagnostics(self, tracker_id: int) -> List[Dict]:
+        return list(self.raw_diagnostics.get(tracker_id, []))
+
+    def get_summary_stats(self) -> Dict:
+        """Global speed summary across all recorded reliable tracks."""
+        reliable_speeds = list(self.max_speeds.values())
+        if not reliable_speeds:
             return {
                 "avg_speed_kmh": 0.0,
                 "max_speed_kmh": 0.0,
                 "active_speed_count": 0,
                 "is_calibrated": self.is_calibrated,
+                "calibration_status": self.calibration_status,
+                "outliers_detected": self.outliers_count,
             }
-        all_speeds = list(self.max_speeds.values())
+
         return {
-            "avg_speed_kmh": round(float(np.mean(all_speeds)), 1),
-            "max_speed_kmh": round(float(np.max(all_speeds)), 1),
-            "active_speed_count": len(all_speeds),
+            "avg_speed_kmh": round(float(np.mean(reliable_speeds)), 1),
+            "max_speed_kmh": round(float(np.max(reliable_speeds)), 1),
+            "active_speed_count": len(reliable_speeds),
             "is_calibrated": self.is_calibrated,
+            "calibration_status": self.calibration_status,
+            "outliers_detected": self.outliers_count,
         }
 
 
@@ -142,7 +204,7 @@ class LineCounter:
         Updates line zone and returns (count_in, count_out).
         Guarantees each tracker ID is counted uniquely per direction.
         """
-        if detections.tracker_id is None or len(detections.tracker_id) == 0:
+        if detections is None or detections.tracker_id is None or len(detections.tracker_id) == 0:
             return self.in_count, self.out_count
 
         crossed_in_mask, crossed_out_mask = self.line_zone.trigger(detections)

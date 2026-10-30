@@ -34,15 +34,24 @@ from src.incidents import IncidentDetector, IncidentEvent
 from src.reporting import ReportGenerator
 
 
-def load_transformer(calibration_path: Optional[str]) -> PerspectiveTransformer:
+def load_transformer(calibration_path: Optional[str]) -> Tuple[PerspectiveTransformer, Optional[str]]:
     if calibration_path is None or not Path(calibration_path).exists():
-        print(
-            "\n[WARNING] No valid --calibration file provided — using PLACEHOLDER "
-            "pixel-to-meter values. Speed numbers will NOT be calibrated ground truth.\n"
-            "Run: python tools/calibrate.py --video <your_video> --output calibration.json\n"
+        transformer = example_calibration()
+        warning = (
+            "No calibration file provided — speed and physical density use uncalibrated "
+            "illustrative scale. Run tools/calibrate.py to measure real-world ground truth."
         )
-        return example_calibration()
-    return PerspectiveTransformer.from_json(calibration_path)
+        return transformer, warning
+
+    transformer = PerspectiveTransformer.from_json(calibration_path)
+    if not transformer.is_calibrated:
+        warning = (
+            f"Calibration is illustrative/unverified ({transformer.provenance}): "
+            f"{transformer.validation_message}. Speed numbers are approximate."
+        )
+    else:
+        warning = None
+    return transformer, warning
 
 
 class TrafficPipeline:
@@ -120,13 +129,24 @@ class TrafficPipeline:
 
         # Initialize core components
         tracker = VehicleTracker(frame_rate=int(fps))
-        transformer = load_transformer(self.calibration_path)
+        transformer, calib_warning = load_transformer(self.calibration_path)
         speed_estimator = SpeedEstimator(transformer, fps=fps)
         line_counter = LineCounter(start=line_start, end=line_end)
+
+        # Use calibrated ground area if genuinely available, else document nominal default
+        if transformer.is_calibrated and transformer.calibrated_area_sq_m > 10.0:
+            roi_area_m2 = transformer.calibrated_area_sq_m
+            roi_source = "calibrated_ground_plane"
+        else:
+            roi_area_m2 = 400.0
+            roi_source = "uncalibrated_nominal_default"
+
         congestion_analyzer = TrafficDensityAnalyzer(
             fps=fps,
             road_roi=road_roi,
             free_flow_speed_kmh=self.free_flow_speed_kmh,
+            roi_area_sq_meters=roi_area_m2,
+            roi_area_source=roi_source,
         )
         incident_detector = IncidentDetector(
             fps=fps,
@@ -323,11 +343,19 @@ class TrafficPipeline:
                 "avg_speed_kmh": speed_summary["avg_speed_kmh"],
                 "max_speed_kmh": speed_summary["max_speed_kmh"],
                 "is_calibrated": transformer.is_calibrated,
-                "speed_warning": None if transformer.is_calibrated else "Uncalibrated: speed derived from approximate scale; run tools/calibrate.py for ground truth.",
+                "calibration_status": transformer.status,
+                "calibration_provenance": transformer.provenance,
+                "speed_warning": calib_warning,
+                "outliers_detected": speed_summary.get("outliers_detected", 0),
                 "per_track_max_speed": {
                     tid: round(speed_estimator.get_max_speed(tid), 1)
                     for tid in unique_tids_seen
                     if speed_estimator.get_max_speed(tid) > 0
+                },
+                "per_track_avg_speed": {
+                    tid: round(speed_estimator.get_avg_speed(tid), 1)
+                    for tid in unique_tids_seen
+                    if speed_estimator.get_avg_speed(tid) > 0
                 },
             },
             "congestion_statistics": congestion_summary,
@@ -339,6 +367,7 @@ class TrafficPipeline:
                     "vehicles_in_roi": s.vehicles_in_roi,
                     "avg_speed_kmh": s.avg_speed_kmh,
                     "flow_rate_vpm": s.flow_rate_vpm,
+                    "density_veh_per_sq_meter": s.density_veh_per_sq_meter,
                     "occupancy_ratio": s.occupancy_ratio,
                     "congestion_score": s.congestion_score,
                     "congestion_level": s.congestion_level,

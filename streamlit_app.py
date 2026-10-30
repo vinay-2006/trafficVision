@@ -94,7 +94,7 @@ with st.sidebar:
         st.success("Custom calibration loaded.")
     elif use_calib and Path(default_sample_calib).exists():
         active_calib_path = default_sample_calib
-        st.info("Using sample road calibration (12m x 45m).")
+        st.warning("⚠️ Using illustrative sample calibration (unverified physical scale; speeds are approximate and not certified ground truth).")
 
     st.subheader("🚨 Incident Thresholds")
     stat_sec = st.slider("Stationary Vehicle Timeout (s)", 1.5, 8.0, 3.0, 0.5)
@@ -216,12 +216,19 @@ if st.session_state.processing_done and st.session_state.pipeline_result:
             </div>
             """, unsafe_allow_html=True)
         with kpi3:
-            calib_badge = '<span class="badge-calib">CALIBRATED</span>' if spd['is_calibrated'] else '<span class="badge-uncalib">ESTIMATED</span>'
+            calib_status = spd.get('calibration_status', 'illustrative' if not spd['is_calibrated'] else 'calibrated')
+            if spd['is_calibrated']:
+                calib_badge = '<span class="badge-calib">CALIBRATED</span>'
+            elif calib_status == 'illustrative':
+                calib_badge = '<span class="badge-uncalib">ILLUSTRATIVE SAMPLE</span>'
+            else:
+                calib_badge = '<span class="badge-uncalib">UNCALIBRATED</span>'
+
             st.markdown(f"""
             <div class="metric-card">
                 <div class="metric-title">Avg Speed ({calib_badge})</div>
                 <div class="metric-value">{spd['avg_speed_kmh']:.1f} <span style="font-size: 1rem;">km/h</span></div>
-                <small style="color: #94a3b8;">Peak: {spd['max_speed_kmh']:.1f} km/h</small>
+                <small style="color: #94a3b8;">Peak: {spd['max_speed_kmh']:.1f} km/h | Outliers Excluded: {spd.get('outliers_excluded_count', 0)}</small>
             </div>
             """, unsafe_allow_html=True)
         with kpi4:
@@ -232,11 +239,12 @@ if st.session_state.processing_done and st.session_state.pipeline_result:
                 "HIGH": "badge-high",
                 "SEVERE": "badge-critical"
             }.get(cong_lvl, "badge-low")
+            roi_src = cong.get("roi_area_source", "nominal")
             st.markdown(f"""
             <div class="metric-card">
-                <div class="metric-title">Congestion Level</div>
+                <div class="metric-title">Congestion Level ({roi_src})</div>
                 <div class="metric-value"><span class="{cong_class}">{cong_lvl}</span></div>
-                <small style="color: #94a3b8;">Peak in ROI: {cong['peak_vehicles_in_roi']} vehicles</small>
+                <small style="color: #94a3b8;">Peak ROI: {cong['peak_vehicles_in_roi']} veh | Area: {cong.get('roi_area_sq_meters', 400.0):.0f} m²</small>
             </div>
             """, unsafe_allow_html=True)
 
@@ -246,13 +254,15 @@ if st.session_state.processing_done and st.session_state.pipeline_result:
         with kpi5:
             st.metric("Total Detections Logged", counts["total_detected_instances"])
         with kpi6:
-            st.metric("Potential Incidents", inc_summary["total_incidents"])
+            st.metric("Potential Incident Alerts", inc_summary["total_incidents"])
         with kpi7:
             st.metric("Processing Throughput", f"{res['processing_fps']:.1f} FPS")
         with kpi8:
             st.metric("Video Duration", f"{meta['duration_sec']:.1f}s ({res['frames_processed']} frames)")
 
-        if not spd["is_calibrated"]:
+        if spd.get("speed_warning"):
+            st.warning(f"⚠️ **Speed Calibration Notice**: {spd['speed_warning']}")
+        elif not spd["is_calibrated"]:
             st.warning("⚠️ Speed values are derived from approximate pixel scaling. Provide a real 4-point measurement via `tools/calibrate.py` to obtain certified ground-truth speed.")
 
         # Quick breakdown charts
@@ -382,9 +392,9 @@ if st.session_state.processing_done and st.session_state.pipeline_result:
     # TAB 4: INCIDENT MONITORING
     # -------------------------------------------------------------------------
     with tabs[3]:
-        st.subheader("Explainable Incident Detection & Safety Events")
+        st.subheader("Potential Traffic Incidents & Anomaly Alerts (Rule-Based)")
 
-        st.info("ℹ️ **Human Verification Notice**: Logged incidents are automated rule-based indicators to assist human traffic controllers. They do not constitute certified or conclusive accidents.")
+        st.info("ℹ️ **Human Verification Mandatory**: All logged incidents are heuristic, rule-based indicators intended to assist traffic operations center personnel. They do NOT constitute confirmed collision or legal determinations.")
 
         i_col1, i_col2, i_col3, i_col4 = st.columns(4)
         sev_counts = inc_summary.get("incidents_by_severity", {})

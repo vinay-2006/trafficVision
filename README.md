@@ -22,21 +22,23 @@ An end-to-end computer vision and traffic intelligence system that processes vid
 
 3. **Perspective Calibration & Real-World Speed Estimation**:
    - 4-point homography transform mapping road pixels to real-world ground-plane meters.
-   - Exponential Moving Average (EMA) speed smoothing with physical plausibility validation (clamped to 240 km/h).
+   - Frame-index elapsed-time calculations ($dt = (f_1 - f_0) / \text{fps}$), resilient to frame skipping.
+   - Exponential Moving Average (EMA) speed smoothing with explicit outlier rejection (speeds > 200 km/h excluded from reliable statistics; preserved in raw diagnostics).
+   - Track discontinuity handling (gaps > 1.5s reset history to eliminate false velocity jumps).
    - Per-vehicle speed tracking, fleet average speed, and maximum observed speed.
-   - **Honest Calibration Caveat**: Speed is explicitly marked uncalibrated with prominent dashboard warnings if default placeholder geometry is used.
+   - **Calibration Integrity**: Bundled sample calibration is explicitly flagged as illustrative (`is_calibrated: false`, `status: illustrative`). Speeds are approximate unless certified field survey measurements are supplied via `tools/calibrate.py`. Genuinely measured calibrations are fully preserved.
 
 4. **Multi-Signal Traffic Density & Congestion Analysis**:
    - Configurable road polygon Region of Interest (ROI).
-   - Computes active vehicle count, spatial density (vehicles/km), road occupancy ratio, and flow rate (vehicles/min).
+   - Computes active vehicle count, physical density (vehicles/m²), road occupancy ratio, and flow rate (vehicles/min). Configurable ROI area source (calibrated ground plane vs. user-configured vs. uncalibrated nominal default; default 400 m² is uncalibrated nominal reference, not measured geometry).
    - Multi-signal rule-based congestion scoring: **LOW**, **MODERATE**, **HIGH**, and **SEVERE**.
    - Congestion buildup trend tracking (`CLEARING`, `STABLE`, `BUILDING`, `CRITICAL`).
 
 5. **Explainable Potential Incident Detection**:
    - Lightweight, rule-based anomaly engine with temporal streak confirmation and cooldown deduplication:
      - 🛑 **Suspicious Stationary Vehicle** (stopped in active lane for > 3.0s).
-     - ⚠️ **Sudden Abnormal Deceleration** (abrupt velocity drop > 25 km/h within 1s).
-     - 🔄 **Abnormal Trajectory / Wrong-Way Driving** (heading deviation > 110°).
+     - ⚠️ **Sudden Abnormal Deceleration** (evaluated using configured deceleration threshold and time window).
+     - 🔄 **Potential Wrong-Way Direction Movement** (movement opposite 2D dominant direction) vs. **Abnormal Lateral Trajectory** (erratic drift).
      - 🚧 **Possible Road Blockage** (cluster of stopped vehicles).
      - 💥 **Possible Collision Indicator** (critical proximity with sudden deceleration).
    - **Operator Notice**: All alerts are explicitly flagged as *potential rule-based indicators* requiring human operator review.
@@ -57,8 +59,8 @@ An end-to-end computer vision and traffic intelligence system that processes vid
 ### 1. Installation
 
 ```bash
-git clone https://github.com/mohamed-amin-ai/traffic-vehicle-analytics.git
-cd traffic-vehicle-analytics
+git clone https://github.com/vinay-2006/trafficVision.git
+cd trafficVision
 pip install -r requirements.txt
 ```
 
@@ -90,12 +92,17 @@ uvicorn api.main:app --host 0.0.0.0 --port 8000
 
 ### 5. Running Automated Tests
 
-Run the full automated test suite (36 tests):
+The test suite is structured into three clear levels:
+- **Unit Tests**: Component-level verification (speed math, frame-index elapsed-time $dt$, track discontinuity gap reset, outlier rejection, 4-point geometry validation, multi-signal congestion scoring, incident temporal suppression/cooldown, report file generation).
+- **Mocked API Tests**: Fast unit validation of FastAPI request handling, schema serialization, parameter boundary checks, and error responses.
+- **Integration & End-to-End Tests**: Complete pipeline execution on verified traffic video (`data/sample_traffic.mp4`), real FastAPI HTTP `TestClient` lifecycle testing, and complete YOLO training execution.
+
+Run the entire unfiltered test suite:
 
 ```bash
-python -m pytest tests/test_congestion.py tests/test_incidents.py tests/test_reporting.py tests/test_end_to_end.py tests/test_api.py tests/test_pipeline.py -k "not weighted and not test_run" -v
+python -m pytest -v
 ```
-All 36 tests pass with exit code 0.
+All unit, API, integration, and training tests pass with exit code 0.
 
 ---
 
@@ -509,7 +516,7 @@ curl -X POST http://localhost:8000/analyze \
   -F "calibration=@calibration.json"
 ```
 
-**If you omit `--calibration`**, the pipeline falls back to a placeholder
+**If you omit `--calibration`**, or supply the bundled sample calibration, the pipeline falls back to an illustrative sample calibration (`src/perspective.py`'s `example_calibration()`, `is_calibrated: false`, `status: illustrative`) and prints a clear warning — those speed numbers are unverified approximations, useful only for testing pipeline mechanics. The API's `/analyze` response includes `calibration_used: false`, `calibration_status: illustrative`, and an explicit `speed_warning`. Only genuinely measured calibrations (`tools/calibrate.py`) carry `is_calibrated: true`.
 calibration (`src/perspective.py`'s `example_calibration()`) and prints a
 loud warning — those speed numbers are not real, only useful for testing
 the pipeline mechanics. The API's `/analyze` response also includes a

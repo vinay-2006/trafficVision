@@ -460,10 +460,170 @@ def test_train_yolo_cli_sampler_weighted_runs_end_to_end(tmp_path):
              "--imgsz", "64", "--batch", "2", "--device", "cpu",
              "--epochs", "1", "--project", out_dir, "--name", "run",
              "--sampler", "weighted"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
         )
         assert result.returncode == 0, result.stdout + result.stderr
         assert "Using WeightedDetectionTrainer" in result.stdout
         assert (Path(out_dir) / "run" / "weights" / "last.pt").exists()
     finally:
         shutil.rmtree(out_dir, ignore_errors=True)
+
+
+# ============================================================================
+# AUDIT REMEDIATION: CALIBRATION INTEGRITY & SPEED ESTIMATION TESTS
+# ============================================================================
+
+def test_perspective_transformer_geometry_validation():
+    """Verify geometry validator rejects degenerate, non-finite, and negative dimensions."""
+    # 1. Collinear points (zero area)
+    collinear = np.array([[100, 100], [200, 200], [300, 300], [400, 400]], dtype=np.float32)
+    valid_target = np.array([[0, 0], [10, 0], [10, 30], [0, 30]], dtype=np.float32)
+    valid, msg = PerspectiveTransformer.validate_geometry(collinear, valid_target)
+    assert not valid
+    assert "area too small or degenerate" in msg
+
+    # 2. Non-finite values (NaN)
+    nan_pts = valid_target.copy()
+    nan_pts[0, 0] = np.nan
+    valid_nan, msg_nan = PerspectiveTransformer.validate_geometry(valid_target, nan_pts)
+    assert not valid_nan
+    assert "non-finite" in msg_nan
+
+    # 3. Target dimensions too small or negative
+    zero_target = np.zeros((4, 2), dtype=np.float32)
+    valid_zero, msg_zero = PerspectiveTransformer.validate_geometry(valid_target, zero_target)
+    assert not valid_zero
+
+
+def test_perspective_transformer_provenance_and_status_gates():
+    """Verify sample/illustrative files cannot claim genuine ground truth."""
+    # Sample file dictionary
+    sample_dict = {
+        "source_points": [[480, 280], [800, 280], [1100, 720], [180, 720]],
+        "target_points_meters": [[0, 0], [10, 0], [10, 50], [0, 50]],
+        "is_calibrated": True,  # Attacker or misconfigured JSON claiming true
+        "provenance": "illustrative_sample",
+        "status": "illustrative",
+    }
+    valid, msg, info = PerspectiveTransformer.validate_calibration_dict(sample_dict)
+    assert valid
+    # Must be forced to False and illustrative because provenance is sample
+    assert info["is_calibrated"] is False
+    assert info["status"] == "illustrative"
+
+    # Genuinely measured user calibration
+    genuine_dict = {
+        "source_points": [[480, 280], [800, 280], [1100, 720], [180, 720]],
+        "target_points_meters": [[0, 0], [10, 0], [10, 50], [0, 50]],
+        "is_calibrated": True,
+        "provenance": "field_survey_measured",
+        "status": "calibrated",
+    }
+    valid_g, msg_g, info_g = PerspectiveTransformer.validate_calibration_dict(genuine_dict)
+    assert valid_g
+    assert info_g["is_calibrated"] is True
+    assert info_g["status"] == "calibrated"
+
+
+def test_speed_estimator_known_displacement_and_frame_skipping():
+    """Verify speed is mathematically exact (displacement / dt) across frame skipping."""
+    # Construct a synthetic 1 px = 0.1 meter metric transformer
+    src = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=np.float32)
+    dst = np.array([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=np.float32)
+    transformer = PerspectiveTransformer(src, dst, is_calibrated=True, status="calibrated", provenance="synthetic_test")
+
+    fps = 25.0
+    estimator = SpeedEstimator(transformer, fps=fps, max_speed_kmh=200.0)
+
+    # Frame 0: Vehicle 1 at (50, 0) -> real-world (5, 0)
+    det0 = sv.Detections(
+        xyxy=np.array([[40, -10, 60, 0]], dtype=np.float32),  # bottom center is (50, 0)
+        tracker_id=np.array([1]),
+        class_id=np.array([2]),
+    )
+    estimator.update(det0, frame_idx=0)
+
+    # Frame 25 (dt = 1.0 sec): Vehicle 1 at (50, 100) -> real-world (5, 10)
+    # Displacement = 10 meters in 1.0 second = 10 m/s = 36.0 km/h
+    det25 = sv.Detections(
+        xyxy=np.array([[40, 90, 60, 100]], dtype=np.float32),  # bottom center is (50, 100)
+        tracker_id=np.array([1]),
+        class_id=np.array([2]),
+    )
+    speeds_continuous = estimator.update(det25, frame_idx=25)
+    assert pytest.approx(speeds_continuous[1], 0.1) == 36.0
+
+    # Test Frame Skipping: Frame 0 -> Frame 20 (dt = 20 / 25 = 0.8s, within 1.5s gap threshold)
+    # Displacement = 80 pixels = 8.0 meters -> 8.0 / 0.8 = 10 m/s = 36.0 km/h
+    estimator_skip = SpeedEstimator(transformer, fps=fps, max_speed_kmh=200.0)
+    estimator_skip.update(det0, frame_idx=0)
+    det20 = sv.Detections(
+        xyxy=np.array([[40, 70, 60, 80]], dtype=np.float32),  # bottom center is (50, 80) -> 8.0m
+        tracker_id=np.array([1]),
+        class_id=np.array([2]),
+    )
+    speeds_skipped = estimator_skip.update(det20, frame_idx=20)
+    assert pytest.approx(speeds_skipped[1], 0.1) == 36.0
+
+
+def test_speed_estimator_outlier_detection_and_exclusion():
+    """Verify speeds > max_speed_kmh are excluded from statistics but kept in raw diagnostics."""
+    src = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=np.float32)
+    dst = np.array([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=np.float32)
+    transformer = PerspectiveTransformer(src, dst, is_calibrated=True, status="calibrated")
+    estimator = SpeedEstimator(transformer, fps=25.0, max_speed_kmh=180.0)
+
+    # Frame 0
+    det0 = sv.Detections(
+        xyxy=np.array([[40, 0, 60, 10]], dtype=np.float32),
+        tracker_id=np.array([10]),
+        class_id=np.array([2]),
+    )
+    estimator.update(det0, frame_idx=0)
+
+    # Frame 1 (1/25 sec = 0.04s): Jump by 1000px = 100 meters in 0.04s => 2500 m/s = 9000 km/h!
+    det1 = sv.Detections(
+        xyxy=np.array([[40, 1000, 60, 1010]], dtype=np.float32),
+        tracker_id=np.array([10]),
+        class_id=np.array([2]),
+    )
+    speeds = estimator.update(det1, frame_idx=1)
+
+    # Outlier must be excluded from reliable speeds
+    assert 10 not in speeds
+    assert estimator.outlier_count == 1
+    assert 10 not in estimator.max_speeds
+
+    # Raw diagnostic measurement must record the raw outlier for inspection
+    raw = estimator.get_raw_diagnostics(10)
+    assert len(raw) == 1
+    assert raw[0]["is_outlier"] is True
+    assert raw[0]["raw_kmh"] > 1000.0
+
+
+def test_speed_estimator_track_discontinuity_gap_reset():
+    """Verify track disappearing for > 1.5s resets history to prevent false velocity jump."""
+    src = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=np.float32)
+    dst = np.array([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=np.float32)
+    transformer = PerspectiveTransformer(src, dst, is_calibrated=True, status="calibrated")
+    # max_gap_seconds = 1.5s -> 37 frames at 25 fps
+    estimator = SpeedEstimator(transformer, fps=25.0, max_gap_seconds=1.5)
+
+    # Frame 10
+    det_first = sv.Detections(
+        xyxy=np.array([[40, 0, 60, 10]], dtype=np.float32),
+        tracker_id=np.array([5]),
+        class_id=np.array([2]),
+    )
+    estimator.update(det_first, frame_idx=10)
+
+    # Frame 70 (60 frames later = 2.4 sec > 1.5 sec threshold)
+    det_reappear = sv.Detections(
+        xyxy=np.array([[40, 80, 60, 90]], dtype=np.float32),
+        tracker_id=np.array([5]),
+        class_id=np.array([2]),
+    )
+    speeds = estimator.update(det_reappear, frame_idx=70)
+
+    # Because gap exceeded threshold, track history reset: no speed calculation on first frame of reappearance
+    assert 5 not in speeds

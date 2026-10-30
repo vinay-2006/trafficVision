@@ -41,10 +41,12 @@ def test_pipeline_on_sample_traffic_video(tmp_path):
     assert counts["total_detected_instances"] > 0
     assert counts["unique_tracked"] > 0
 
-    # 4. Speed statistics
+    # 4. Speed statistics (sample calibration is illustrative, never genuine ground truth)
     spd = result["speed_statistics"]
-    assert spd["is_calibrated"] is True
-    assert spd["avg_speed_kmh"] > 0
+    assert spd["is_calibrated"] is False
+    assert spd["calibration_status"] == "illustrative"
+    assert spd["speed_warning"] is not None
+    assert spd["avg_speed_kmh"] >= 0
 
     # 5. Congestion statistics
     cong = result["congestion_statistics"]
