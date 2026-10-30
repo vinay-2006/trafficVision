@@ -19,16 +19,19 @@ import numpy as np
 
 
 class PerspectiveTransformer:
-    def __init__(self, source: np.ndarray, target: np.ndarray):
+    def __init__(self, source: np.ndarray, target: np.ndarray, is_calibrated: bool = True):
         """
         Args:
             source: (4, 2) array of pixel coords, road quadrilateral,
                 ordered top-left, top-right, bottom-right, bottom-left.
             target: (4, 2) array of real-world coords in meters for the
                 same 4 points, same ordering (a rectangle).
+            is_calibrated: whether these coordinates represent measured ground truth
+                versus an uncalibrated default / placeholder.
         """
         self.source = np.asarray(source, dtype=np.float32)
         self.target = np.asarray(target, dtype=np.float32)
+        self.is_calibrated = is_calibrated
         self.m = cv2.getPerspectiveTransform(self.source, self.target)
 
     def transform_points(self, points: np.ndarray) -> np.ndarray:
@@ -45,6 +48,7 @@ class PerspectiveTransformer:
         data = {
             "source_points": self.source.tolist(),
             "target_points_meters": self.target.tolist(),
+            "is_calibrated": self.is_calibrated,
         }
         Path(path).write_text(json.dumps(data, indent=2))
 
@@ -55,14 +59,15 @@ class PerspectiveTransformer:
         data = json.loads(Path(path).read_text())
         source = np.array(data["source_points"], dtype=np.float32)
         target = np.array(data["target_points_meters"], dtype=np.float32)
-        return cls(source, target)
+        is_calibrated = data.get("is_calibrated", True)
+        return cls(source, target, is_calibrated=is_calibrated)
 
 
 def example_calibration() -> PerspectiveTransformer:
     """
     Placeholder calibration for a 960x540 UA-DETRAC-style frame.
-    Replace SOURCE with real pixel coordinates picked from an actual
-    frame of your footage before using this for real speed numbers.
+    Marked with is_calibrated=False so the system alerts users that
+    real-world measurements must be provided for certified speed.
     """
     source = np.array([
         [330, 250],   # top-left of road segment
@@ -77,4 +82,4 @@ def example_calibration() -> PerspectiveTransformer:
         [10, 40],
         [0, 40],
     ])
-    return PerspectiveTransformer(source, target)
+    return PerspectiveTransformer(source, target, is_calibrated=False)

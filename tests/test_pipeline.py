@@ -224,8 +224,9 @@ def test_train_yolo_requires_data_unless_resuming():
     """--data is required for a fresh run, but not when --resume is set
     (the checkpoint's own saved config supplies it instead)."""
     import subprocess
+    import sys
     result = subprocess.run(
-        ["python3", "train/train_yolo.py", "--epochs", "1"],
+        [sys.executable, "train/train_yolo.py", "--epochs", "1"],
         capture_output=True, text=True,
     )
     assert result.returncode != 0
@@ -234,8 +235,9 @@ def test_train_yolo_requires_data_unless_resuming():
 
 def test_train_yolo_rejects_nonexistent_resume_path():
     import subprocess
+    import sys
     result = subprocess.run(
-        ["python3", "train/train_yolo.py", "--resume", "/tmp/definitely_does_not_exist_12345.pt"],
+        [sys.executable, "train/train_yolo.py", "--resume", "/tmp/definitely_does_not_exist_12345.pt"],
         capture_output=True, text=True,
     )
     assert result.returncode != 0
@@ -249,6 +251,7 @@ def test_train_yolo_refuses_resume_with_missing_data_and_no_override(tmp_path):
     behavior, not a guess -- this exact silent fallback was observed
     during manual testing before this safety check was added)."""
     import subprocess
+    import sys
     import torch
     from ultralytics import YOLO
 
@@ -263,7 +266,7 @@ def test_train_yolo_refuses_resume_with_missing_data_and_no_override(tmp_path):
     }, ckpt_path)
 
     result = subprocess.run(
-        ["python3", "train/train_yolo.py", "--resume", str(ckpt_path), "--device", "cpu"],
+        [sys.executable, "train/train_yolo.py", "--resume", str(ckpt_path), "--device", "cpu"],
         capture_output=True, text=True,
     )
     assert result.returncode != 0
@@ -329,7 +332,7 @@ def test_add_test_split_rare_data_skips_car_only_frames(tmp_path):
 
     xml_dir, img_dir, train_dir = _make_test_split_fixture(tmp_path)
     result = subprocess.run(
-        ["python3", "train/add_test_split_rare_data.py",
+        [sys.executable, "train/add_test_split_rare_data.py",
          "--xml-dir", str(xml_dir), "--img-dir", str(img_dir), "--train-dir", str(train_dir)],
         capture_output=True, text=True,
     )
@@ -415,7 +418,7 @@ def test_distributed_weighted_sampler_partitions_correctly():
     assert list(sampler0) != indices0
 
 
-def test_weighted_trainer_runs_real_training_end_to_end():
+def test_weighted_trainer_runs_real_training_end_to_end(tmp_path):
     """Full integration test: actually run a real (tiny) Ultralytics
     training job using WeightedDetectionTrainer, not just unit-test the
     pieces in isolation. Confirms the custom get_dataloader() override
@@ -424,7 +427,7 @@ def test_weighted_trainer_runs_real_training_end_to_end():
     from ultralytics import YOLO
     from train.weighted_sampler_trainer import WeightedDetectionTrainer
 
-    out_dir = "/tmp/weighted_trainer_pytest"
+    out_dir = str(tmp_path / "weighted_trainer_pytest")
     shutil.rmtree(out_dir, ignore_errors=True)
     try:
         model = YOLO("yolo11n.pt")
@@ -439,19 +442,20 @@ def test_weighted_trainer_runs_real_training_end_to_end():
         shutil.rmtree(out_dir, ignore_errors=True)
 
 
-def test_train_yolo_cli_sampler_weighted_runs_end_to_end():
+def test_train_yolo_cli_sampler_weighted_runs_end_to_end(tmp_path):
     """Same as above, but through the actual train_yolo.py CLI --sampler
     weighted flag -- catches wiring bugs (wrong import path, broken
     argument plumbing) that a module-level test alone wouldn't."""
     import shutil
     import subprocess
+    import sys
     from pathlib import Path
 
-    out_dir = "/tmp/cli_weighted_pytest"
+    out_dir = str(tmp_path / "cli_weighted_pytest")
     shutil.rmtree(out_dir, ignore_errors=True)
     try:
         result = subprocess.run(
-            ["python3", "train/train_yolo.py",
+            [sys.executable, "train/train_yolo.py",
              "--data", "coco8.yaml", "--model", "yolo11n.pt",
              "--imgsz", "64", "--batch", "2", "--device", "cpu",
              "--epochs", "1", "--project", out_dir, "--name", "run",

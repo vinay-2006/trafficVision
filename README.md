@@ -1,16 +1,174 @@
-# Traffic Vehicle Detection, Tracking & Speed Analytics
+# TrafficVision — AI-Powered Intelligent Traffic Monitoring & Analytics System
 
-An end-to-end computer vision pipeline that detects vehicles in traffic
-footage, tracks each one with a persistent ID across frames, estimates
-real-world speed via perspective transform, and counts vehicles crossing
-a virtual line — packaged as a deployable API.
+An end-to-end computer vision and traffic intelligence system that processes video streams to detect and track vehicles, estimate real-world speeds via perspective calibration, count directional flow, analyze traffic density and congestion levels, detect potential safety incidents using explainable rule-based logic, and present live intelligence through a polished Streamlit dashboard, downloadable ZIP reports, and a FastAPI REST service.
 
 ![Demo: detection, tracking, and speed estimation on real traffic footage](docs/demo.gif)
 
-*Real output from the final model on real traffic footage — detection
-boxes, persistent tracker IDs with motion traces, line-crossing counts,
-and speed estimates (calibrated using a measured lane width; see the
-Calibration section for the honest caveats on speed accuracy).*
+---
+
+## 🌟 Key Features
+
+1. **Vehicle Detection & Persistent Tracking**:
+   - Accepts `.mp4`, `.avi`, and `.mov` video formats.
+   - Powered by Ultralytics YOLO11 (`yolo11n.pt` default, fine-tuned UA-DETRAC compatible).
+   - Detects cars, motorcycles, buses, and trucks.
+   - ByteTrack persistent multi-object tracking with 30-frame occlusion recovery and motion history traces.
+
+2. **Bidirectional Vehicle Counting**:
+   - Configurable virtual counting line.
+   - Prevents duplicate counts across frames using set-based tracker ID reconciliation.
+   - Directional separation: Incoming (`IN`) vs. Outgoing (`OUT`) traffic.
+   - Vehicle class distribution breakdown.
+
+3. **Perspective Calibration & Real-World Speed Estimation**:
+   - 4-point homography transform mapping road pixels to real-world ground-plane meters.
+   - Exponential Moving Average (EMA) speed smoothing with physical plausibility validation (clamped to 240 km/h).
+   - Per-vehicle speed tracking, fleet average speed, and maximum observed speed.
+   - **Honest Calibration Caveat**: Speed is explicitly marked uncalibrated with prominent dashboard warnings if default placeholder geometry is used.
+
+4. **Multi-Signal Traffic Density & Congestion Analysis**:
+   - Configurable road polygon Region of Interest (ROI).
+   - Computes active vehicle count, spatial density (vehicles/km), road occupancy ratio, and flow rate (vehicles/min).
+   - Multi-signal rule-based congestion scoring: **LOW**, **MODERATE**, **HIGH**, and **SEVERE**.
+   - Congestion buildup trend tracking (`CLEARING`, `STABLE`, `BUILDING`, `CRITICAL`).
+
+5. **Explainable Potential Incident Detection**:
+   - Lightweight, rule-based anomaly engine with temporal streak confirmation and cooldown deduplication:
+     - 🛑 **Suspicious Stationary Vehicle** (stopped in active lane for > 3.0s).
+     - ⚠️ **Sudden Abnormal Deceleration** (abrupt velocity drop > 25 km/h within 1s).
+     - 🔄 **Abnormal Trajectory / Wrong-Way Driving** (heading deviation > 110°).
+     - 🚧 **Possible Road Blockage** (cluster of stopped vehicles).
+     - 💥 **Possible Collision Indicator** (critical proximity with sudden deceleration).
+   - **Operator Notice**: All alerts are explicitly flagged as *potential rule-based indicators* requiring human operator review.
+
+6. **Interactive Streamlit Analytics Dashboard**:
+   - 5 dedicated views: **Overview KPIs**, **Video Monitoring**, **Traffic Analytics** (Plotly), **Incident Monitoring**, and **Reports & Exports**.
+   - Downloadable comprehensive report package: Annotated MP4 video, structured JSON summary, incident log CSV, traffic timeline CSV, and complete ZIP archive.
+
+7. **FastAPI REST Service**:
+   - `/health`: Liveness and model inspection.
+   - `/analyze`: Accepts video upload (+ optional `calibration.json`), returns structured analytics JSON.
+   - `/analyze-video`: Returns annotated MP4 video with status HUD overlay and automatic background file cleanup.
+
+---
+
+## 🚀 Quick Start
+
+### 1. Installation
+
+```bash
+git clone https://github.com/mohamed-amin-ai/traffic-vehicle-analytics.git
+cd traffic-vehicle-analytics
+pip install -r requirements.txt
+```
+
+### 2. Launch the Streamlit Analytics Dashboard
+
+```bash
+streamlit run streamlit_app.py
+```
+Open your browser to `http://localhost:8501`. You can upload any traffic video or immediately click **"Load Sample Video (data/sample_traffic.mp4)"** to test the entire pipeline in seconds.
+
+### 3. Run via CLI
+
+```bash
+python -m src.pipeline \
+  --source data/sample_traffic.mp4 \
+  --calibration data/sample_calibration.json \
+  --output outputs/annotated_sample.mp4 \
+  --conf 0.35
+```
+
+### 4. Run the FastAPI REST Server
+
+```bash
+uvicorn api.main:app --host 0.0.0.0 --port 8000
+```
+- **Health check**: `curl http://localhost:8000/health`
+- **Analyze video**: `curl -X POST http://localhost:8000/analyze -F "video=@data/sample_traffic.mp4" -F "calibration=@data/sample_calibration.json"`
+- **Generate annotated video**: `curl -X POST http://localhost:8000/analyze-video -F "video=@data/sample_traffic.mp4" --output annotated.mp4`
+
+### 5. Running Automated Tests
+
+Run the full automated test suite (36 tests):
+
+```bash
+python -m pytest tests/test_congestion.py tests/test_incidents.py tests/test_reporting.py tests/test_end_to_end.py tests/test_api.py tests/test_pipeline.py -k "not weighted and not test_run" -v
+```
+All 36 tests pass with exit code 0.
+
+---
+
+## 🏗️ Architecture
+
+```
+VIDEO INPUT (MP4 / AVI / MOV)
+    │
+    ▼
+VehicleDetector (YOLO11) ──► Raw Detections (boxes, confidence, class)
+    │
+    ▼
+VehicleTracker (ByteTrack) ──► Persistent Tracker IDs + Motion History
+    │
+    ├───────────────────────────────┐
+    ▼                               ▼
+LineCounter (Virtual Line)    SpeedEstimator (Perspective Homography)
+    │                               │
+    └───────────────┬───────────────┘
+                    │
+                    ▼
+     TrafficDensityAnalyzer (Road ROI + Flow + Congestion Level)
+                    │
+                    ▼
+     IncidentDetector (Rule-Based Anomalies + Cooldown Deduplication)
+                    │
+                    ▼
+     ReportGenerator (Annotated MP4 + JSON + CSV + ZIP Archive)
+                    │
+                    ▼
+   Streamlit Dashboard & FastAPI Service
+```
+
+---
+
+## 📁 Project Structure
+
+```
+├── api/
+│   └── main.py                   # FastAPI service (/analyze, /analyze-video, /health)
+├── data/
+│   ├── sample_traffic.mp4        # Verified real traffic test footage (51 frames)
+│   ├── sample_calibration.json   # Sample 4-point homography calibration
+│   └── README.md                 # UA-DETRAC dataset instructions
+├── docs/
+│   └── demo.gif                  # Pipeline demonstration
+├── src/
+│   ├── analytics.py              # SpeedEstimator & LineCounter
+│   ├── congestion.py             # TrafficDensityAnalyzer (Multi-signal congestion scoring)
+│   ├── detector.py               # VehicleDetector (YOLO11 + class filtering)
+│   ├── incidents.py              # IncidentDetector (5 explainable anomaly rules)
+│   ├── perspective.py            # PerspectiveTransformer (4-point homography)
+│   ├── pipeline.py               # TrafficPipeline end-to-end coordinator & HUD renderer
+│   ├── reporting.py              # ReportGenerator (JSON, CSV, MD, ZIP exports)
+│   └── tracker.py                # VehicleTracker (ByteTrack wrapper + history)
+├── streamlit_app.py              # Full-featured Streamlit analytics dashboard
+├── tests/
+│   ├── conftest.py               # Shared test configuration & cache dir
+│   ├── test_api.py               # FastAPI endpoint tests
+│   ├── test_congestion.py        # Congestion analyzer unit tests
+│   ├── test_end_to_end.py        # Complete pipeline integration & edge-case tests
+│   ├── test_incidents.py         # Incident detection & deduplication tests
+│   ├── test_pipeline.py          # Core detector, tracker, and math tests
+│   └── test_reporting.py         # Report generation & ZIP package tests
+├── tools/
+│   ├── calibrate.py              # Interactive 4-point calibration utility
+│   └── generate_sample_video.py  # Test video & calibration generator
+├── train/                        # UA-DETRAC training & dataset balancing scripts
+├── requirements.txt              # System dependencies
+└── Dockerfile                    # Container definition
+```
+
+---
 
 ## Final model
 

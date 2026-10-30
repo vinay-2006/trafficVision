@@ -1,3 +1,5 @@
+# Cache and virtual environments
+.cache/
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -11,6 +13,8 @@ runs/
 # Dataset — download separately, see data/README.md
 data/*
 !data/README.md
+!data/sample_traffic.mp4
+!data/sample_calibration.json
 
 # Ultralytics auto-downloads this sample dataset when running the
 # tests/ integration tests locally (test_weighted_trainer_runs_real_
@@ -19,3 +23,4 @@ datasets/
 
 # Generated outputs
 outputs/
+*.zip
