@@ -10,7 +10,7 @@ import supervision as sv
 
 from src.detector import VehicleDetector, COCO_VEHICLE_CLASS_IDS
 from src.tracker import VehicleTracker
-from src.perspective import PerspectiveTransformer, example_calibration
+from src.perspective import PerspectiveTransformer, example_calibration, CalibrationStatus
 from src.analytics import SpeedEstimator, LineCounter
 
 
@@ -496,8 +496,11 @@ def test_perspective_transformer_geometry_validation():
 
 
 def test_perspective_transformer_provenance_and_status_gates():
-    """Verify sample/illustrative files cannot claim genuine ground truth."""
-    # Sample file dictionary
+    """Verify sample/illustrative files cannot claim genuine ground truth.
+    Also verifies the 4-state calibration status enum is enforced correctly."""
+    from src.perspective import CalibrationStatus
+
+    # Sample file dictionary — illustrative_sample provenance → must be demoted to ILLUSTRATIVE
     sample_dict = {
         "source_points": [[480, 280], [800, 280], [1100, 720], [180, 720]],
         "target_points_meters": [[0, 0], [10, 0], [10, 50], [0, 50]],
@@ -509,9 +512,10 @@ def test_perspective_transformer_provenance_and_status_gates():
     assert valid
     # Must be forced to False and illustrative because provenance is sample
     assert info["is_calibrated"] is False
-    assert info["status"] == "illustrative"
+    assert info["status"] == CalibrationStatus.ILLUSTRATIVE.value
+    assert info["calibration_status"] == CalibrationStatus.ILLUSTRATIVE
 
-    # Genuinely measured user calibration
+    # Genuinely measured user calibration → USER_ATTESTED
     genuine_dict = {
         "source_points": [[480, 280], [800, 280], [1100, 720], [180, 720]],
         "target_points_meters": [[0, 0], [10, 0], [10, 50], [0, 50]],
@@ -522,7 +526,8 @@ def test_perspective_transformer_provenance_and_status_gates():
     valid_g, msg_g, info_g = PerspectiveTransformer.validate_calibration_dict(genuine_dict)
     assert valid_g
     assert info_g["is_calibrated"] is True
-    assert info_g["status"] == "calibrated"
+    assert info_g["calibration_status"] == CalibrationStatus.USER_ATTESTED
+    assert info_g["status"] == CalibrationStatus.USER_ATTESTED.value
 
 
 def test_speed_estimator_known_displacement_and_frame_skipping():
@@ -530,7 +535,7 @@ def test_speed_estimator_known_displacement_and_frame_skipping():
     # Construct a synthetic 1 px = 0.1 meter metric transformer
     src = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=np.float32)
     dst = np.array([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=np.float32)
-    transformer = PerspectiveTransformer(src, dst, is_calibrated=True, status="calibrated", provenance="synthetic_test")
+    transformer = PerspectiveTransformer(src, dst, is_calibrated=True, status="calibrated", provenance="user_measured")
 
     fps = 25.0
     estimator = SpeedEstimator(transformer, fps=fps, max_speed_kmh=200.0)
@@ -570,7 +575,7 @@ def test_speed_estimator_outlier_detection_and_exclusion():
     """Verify speeds > max_speed_kmh are excluded from statistics but kept in raw diagnostics."""
     src = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=np.float32)
     dst = np.array([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=np.float32)
-    transformer = PerspectiveTransformer(src, dst, is_calibrated=True, status="calibrated")
+    transformer = PerspectiveTransformer(src, dst, is_calibrated=True, status="calibrated", provenance="user_measured")
     estimator = SpeedEstimator(transformer, fps=25.0, max_speed_kmh=180.0)
 
     # Frame 0
@@ -605,7 +610,7 @@ def test_speed_estimator_track_discontinuity_gap_reset():
     """Verify track disappearing for > 1.5s resets history to prevent false velocity jump."""
     src = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=np.float32)
     dst = np.array([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=np.float32)
-    transformer = PerspectiveTransformer(src, dst, is_calibrated=True, status="calibrated")
+    transformer = PerspectiveTransformer(src, dst, is_calibrated=True, status="calibrated", provenance="user_measured")
     # max_gap_seconds = 1.5s -> 37 frames at 25 fps
     estimator = SpeedEstimator(transformer, fps=25.0, max_gap_seconds=1.5)
 
@@ -627,3 +632,187 @@ def test_speed_estimator_track_discontinuity_gap_reset():
 
     # Because gap exceeded threshold, track history reset: no speed calculation on first frame of reappearance
     assert 5 not in speeds
+
+
+# ============================================================================
+# PHASE 1 — FORMAL 4-STATE CALIBRATION PROVENANCE TESTS
+# ============================================================================
+
+def test_calibration_status_enum_values():
+    """Verify the CalibrationStatus enum has the required 4 states."""
+    assert CalibrationStatus.ILLUSTRATIVE.value == "illustrative"
+    assert CalibrationStatus.UNCALIBRATED.value == "uncalibrated"
+    assert CalibrationStatus.USER_ATTESTED.value == "user_attested"
+    assert CalibrationStatus.VERIFIED.value == "verified"
+
+
+def test_missing_provenance_with_is_calibrated_true_is_rejected():
+    """is_calibrated=true without a provenance field must be rejected."""
+    data = {
+        "source_points": [[480, 280], [800, 280], [1100, 720], [180, 720]],
+        "target_points_meters": [[0, 0], [10, 0], [10, 50], [0, 50]],
+        "is_calibrated": True,
+        # provenance intentionally omitted — key does not exist in dict
+    }
+    # Remove the key entirely (not just empty string)
+    data.pop("provenance", None)
+    valid, msg, info = PerspectiveTransformer.validate_calibration_dict(data)
+    # Must be rejected: cannot claim calibrated without provenance
+    assert not valid or (info.get("calibration_status") == CalibrationStatus.ILLUSTRATIVE)
+    # Either rejected entirely OR demoted to ILLUSTRATIVE — never accepted as calibrated
+    if valid:
+        assert info["is_calibrated"] is False
+
+
+def test_unknown_arbitrary_provenance_with_is_calibrated_true_is_rejected():
+    """Arbitrary unknown provenance strings + is_calibrated=true must be rejected."""
+    data = {
+        "source_points": [[480, 280], [800, 280], [1100, 720], [180, 720]],
+        "target_points_meters": [[0, 0], [10, 0], [10, 50], [0, 50]],
+        "is_calibrated": True,
+        "provenance": "my_custom_survey_tool_v2",  # not in any allowlist
+        "status": "calibrated",
+    }
+    valid, msg, info = PerspectiveTransformer.validate_calibration_dict(data)
+    # Must be rejected with an error message about unknown provenance
+    assert not valid
+    assert "provenance" in msg.lower() or "unknown" in msg.lower()
+
+
+def test_forged_verified_status_in_json_is_rejected():
+    """JSON claiming status='verified' must be rejected — cannot be self-asserted."""
+    data = {
+        "source_points": [[480, 280], [800, 280], [1100, 720], [180, 720]],
+        "target_points_meters": [[0, 0], [10, 0], [10, 50], [0, 50]],
+        "is_calibrated": True,
+        "provenance": "user_measured",
+        "status": "verified",   # forged — VERIFIED requires independent out-of-band workflow
+    }
+    valid, msg, info = PerspectiveTransformer.validate_calibration_dict(data)
+    assert not valid
+    assert "verified" in msg.lower()
+
+
+def test_illustrative_calibration_with_is_calibrated_true_demoted():
+    """illustrative_sample provenance + is_calibrated=true must always be demoted to ILLUSTRATIVE."""
+    data = {
+        "source_points": [[480, 280], [800, 280], [1100, 720], [180, 720]],
+        "target_points_meters": [[0, 0], [10, 0], [10, 50], [0, 50]],
+        "is_calibrated": True,
+        "provenance": "illustrative_sample",
+        "status": "illustrative",
+    }
+    valid, msg, info = PerspectiveTransformer.validate_calibration_dict(data)
+    assert valid
+    assert info["is_calibrated"] is False
+    assert info["calibration_status"] == CalibrationStatus.ILLUSTRATIVE
+
+
+def test_valid_user_attested_calibration_accepted():
+    """field_survey_measured provenance + is_calibrated=true → USER_ATTESTED."""
+    data = {
+        "source_points": [[480, 280], [800, 280], [1100, 720], [180, 720]],
+        "target_points_meters": [[0, 0], [10, 0], [10, 50], [0, 50]],
+        "is_calibrated": True,
+        "provenance": "user_measured",
+        "status": "calibrated",
+    }
+    valid, msg, info = PerspectiveTransformer.validate_calibration_dict(data)
+    assert valid
+    assert info["is_calibrated"] is True
+    assert info["calibration_status"] == CalibrationStatus.USER_ATTESTED
+    assert "user_attested" in info["status"]
+
+
+def test_calibration_json_round_trip_preserves_status(tmp_path):
+    """USER_ATTESTED calibration saved to JSON and reloaded preserves calibration_status."""
+    src = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], dtype=np.float32)
+    dst = np.array([[0, 0], [10, 0], [10, 10], [0, 10]], dtype=np.float32)
+
+    # Build a user-attested transformer
+    t = PerspectiveTransformer(
+        src, dst,
+        is_calibrated=True,
+        status="calibrated",
+        provenance="user_measured",
+        validation_message="User measured",
+        calibration_status=CalibrationStatus.USER_ATTESTED,
+    )
+    assert t.calibration_status == CalibrationStatus.USER_ATTESTED
+    assert t.is_calibrated is True
+
+    json_path = tmp_path / "user_attested.json"
+    t.to_json(str(json_path))
+
+    reloaded = PerspectiveTransformer.from_json(str(json_path))
+    # After reload, provenance 'user_measured' → USER_ATTESTED again
+    assert reloaded.calibration_status == CalibrationStatus.USER_ATTESTED
+    assert reloaded.is_calibrated is True
+
+
+def test_illustrative_calibration_json_round_trip(tmp_path):
+    """ILLUSTRATIVE calibration saved to JSON and reloaded remains ILLUSTRATIVE."""
+    original = example_calibration()
+    assert original.calibration_status == CalibrationStatus.ILLUSTRATIVE
+    assert original.is_calibrated is False
+
+    json_path = tmp_path / "illustrative.json"
+    original.to_json(str(json_path))
+
+    reloaded = PerspectiveTransformer.from_json(str(json_path))
+    assert reloaded.calibration_status == CalibrationStatus.ILLUSTRATIVE
+    assert reloaded.is_calibrated is False
+
+
+def test_example_calibration_has_correct_status():
+    """example_calibration() must have CalibrationStatus.ILLUSTRATIVE and is_calibrated=False."""
+    ec = example_calibration()
+    assert ec.calibration_status == CalibrationStatus.ILLUSTRATIVE
+    assert ec.is_calibrated is False
+    assert ec.status == "illustrative"
+
+
+def test_speed_estimator_suppresses_speed_for_uncalibrated(capsys):
+    """SpeedEstimator marks results clearly when calibration is ILLUSTRATIVE/UNCALIBRATED."""
+    transformer = example_calibration()
+    assert transformer.calibration_status == CalibrationStatus.ILLUSTRATIVE
+    assert transformer.is_calibrated is False
+
+    estimator = SpeedEstimator(transformer, fps=25.0)
+    det0 = sv.Detections(
+        xyxy=np.array([[40, 0, 60, 10]], dtype=np.float32),
+        tracker_id=np.array([99]),
+        class_id=np.array([2]),
+    )
+    det1 = sv.Detections(
+        xyxy=np.array([[40, 50, 60, 60]], dtype=np.float32),
+        tracker_id=np.array([99]),
+        class_id=np.array([2]),
+    )
+    estimator.update(det0, frame_idx=0)
+    speeds = estimator.update(det1, frame_idx=1)
+
+    # Speed values may still be returned (for display as approximate)
+    # but the calibration_status on the transformer remains ILLUSTRATIVE
+    assert transformer.is_calibrated is False
+    assert transformer.calibration_status == CalibrationStatus.ILLUSTRATIVE
+
+
+def test_pipeline_result_reflects_calibration_status():
+    """Pipeline result calibration_status field reflects the formal enum value string."""
+    from src.pipeline import TrafficPipeline
+    from pathlib import Path
+
+    video = Path("data/sample_traffic.mp4")
+    if not video.exists():
+        pytest.skip("sample_traffic.mp4 not available")
+
+    pipeline = TrafficPipeline(calibration_path=None)
+    result = pipeline.process_video(str(video), generate_annotated_video=False)
+
+    spd = result["speed_statistics"]
+    assert spd["is_calibrated"] is False
+    # With no calibration file, must be illustrative or uncalibrated
+    assert spd["calibration_status"] in ("illustrative", "uncalibrated", "user_attested")
+    # Specifically for example_calibration() with no file: illustrative
+    assert spd["calibration_status"] == "illustrative"

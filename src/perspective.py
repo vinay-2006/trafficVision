@@ -5,19 +5,135 @@ between frames can be converted into an actual speed.
 
 Calibration integrity rules:
 - Calibration is per-camera/per-video.
-- Bundled sample calibrations are illustrative/examples, NEVER certified ground truth.
+- Bundled sample calibrations are ILLUSTRATIVE/EXAMPLES, never certified ground truth.
 - Uploaded calibrations must be strictly validated for finite coordinates,
   non-degenerate quadrilateral geometry, positive dimensions, and non-singular matrix.
-- A JSON field containing `is_calibrated: true` is never trusted blindly without
+- A JSON field containing `is_calibrated: true` is NEVER trusted blindly without
   provenance verification and geometric validation.
+- Calibration status is a formal 4-state enum — not a free-text field.
+
+Calibration States (CalibrationStatus enum):
+  ILLUSTRATIVE   – example / demo / placeholder; never considered calibrated.
+  UNCALIBRATED   – missing or insufficient calibration information.
+  USER_ATTESTED  – user explicitly confirms measurements were obtained from the
+                   actual camera scene; valid geometry required; NOT independently verified.
+  VERIFIED       – reserved for a genuine independent verification workflow;
+                   NOT assigned merely because JSON contains is_calibrated=true.
 """
 import json
 import math
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
+
+
+class CalibrationStatus(Enum):
+    """Formal 4-state calibration provenance enum.
+
+    ILLUSTRATIVE  – example / demo calibration; speeds are approximate only.
+    UNCALIBRATED  – missing or insufficient calibration information.
+    USER_ATTESTED – user has confirmed measurements from the actual scene; not independently verified.
+    VERIFIED      – independently verified; only assign via an explicit verification workflow.
+    """
+    ILLUSTRATIVE = "illustrative"
+    UNCALIBRATED = "uncalibrated"
+    USER_ATTESTED = "user_attested"
+    VERIFIED = "verified"
+
+
+# ---------------------------------------------------------------------------
+# Strict provenance allowlists
+# ---------------------------------------------------------------------------
+_ILLUSTRATIVE_PROVENANCES = frozenset({
+    "illustrative_sample",
+    "illustrative_example",
+    "example",
+    "demo",
+    "placeholder",
+    "synthetic_test",
+    "unknown_upload",
+    "default_placeholder",
+})
+
+_USER_ATTESTED_PROVENANCES = frozenset({
+    "user_measured",
+    "field_survey_measured",
+    "measured_user",
+    "user_attested",
+})
+
+# VERIFIED is intentionally not reachable through the JSON upload path.
+# It requires an out-of-band verification token that this version does not implement.
+
+
+def _resolve_calibration_status(
+    raw_is_calibrated: bool,
+    provenance: str,
+    json_status: str,
+) -> CalibrationStatus:
+    """Map raw JSON fields to a formal CalibrationStatus, applying the integrity rules."""
+    prov_lower = provenance.strip().lower()
+    stat_lower = json_status.strip().lower()
+
+    # Any illustrative / sample / demo provenance → always ILLUSTRATIVE regardless of flags
+    if prov_lower in _ILLUSTRATIVE_PROVENANCES or stat_lower in ("illustrative", "uncalibrated"):
+        return CalibrationStatus.ILLUSTRATIVE
+
+    # "verified" status in JSON is rejected — cannot be self-asserted
+    if stat_lower == "verified":
+        raise ValueError(
+            f"Calibration status 'verified' cannot be self-asserted via JSON upload. "
+            f"Independent verification is required. Got provenance='{provenance}', status='{json_status}'."
+        )
+
+    if not raw_is_calibrated:
+        return CalibrationStatus.UNCALIBRATED
+
+    # is_calibrated=true path: provenance MUST be in the user-attested allowlist.
+    # Status alone is not sufficient; provenance is the authoritative attestation field.
+    if prov_lower in _USER_ATTESTED_PROVENANCES:
+        return CalibrationStatus.USER_ATTESTED
+
+    # Unknown or missing provenance with is_calibrated=true → reject
+    if not prov_lower:
+        raise ValueError(
+            "Calibration JSON claims is_calibrated=true but is missing 'provenance'. "
+            "Provide provenance='user_measured' or similar to attest your measurement."
+        )
+
+    raise ValueError(
+        f"Unknown provenance '{provenance}' with is_calibrated=true. "
+        f"Accepted provenances for user-attested calibration: {sorted(_USER_ATTESTED_PROVENANCES)}. "
+        f"Accepted provenances for illustrative calibration: {sorted(_ILLUSTRATIVE_PROVENANCES)}."
+    )
+
+
+def _resolve_calibration_status_from_legacy(
+    is_calibrated: bool,
+    status_str: str,
+    provenance: str,
+) -> CalibrationStatus:
+    """Map legacy (is_calibrated, status, provenance) strings to CalibrationStatus enum.
+    Used by PerspectiveTransformer.__init__ for backward compatibility."""
+    prov_lower = provenance.strip().lower()
+    stat_lower = status_str.strip().lower()
+
+    if prov_lower in _ILLUSTRATIVE_PROVENANCES or stat_lower in ("illustrative", "uncalibrated", "invalid"):
+        return CalibrationStatus.ILLUSTRATIVE
+
+    if not is_calibrated:
+        return CalibrationStatus.UNCALIBRATED
+
+    # For legacy fields: provenance is the authoritative field.
+    # "calibrated" status alone is not accepted; provenance must be in the allowlist.
+    if prov_lower in _USER_ATTESTED_PROVENANCES:
+        return CalibrationStatus.USER_ATTESTED
+
+    # Conservative fallback for unknown legacy provenances
+    return CalibrationStatus.ILLUSTRATIVE
 
 
 class PerspectiveTransformer:
@@ -29,6 +145,7 @@ class PerspectiveTransformer:
         status: str = "illustrative",
         provenance: str = "default_placeholder",
         validation_message: str = "Uncalibrated example geometry",
+        calibration_status: Optional[CalibrationStatus] = None,
     ):
         """
         Args:
@@ -37,9 +154,11 @@ class PerspectiveTransformer:
             target: (4, 2) array of real-world coords in meters for the
                 same 4 points, same ordering (a rectangle).
             is_calibrated: whether these coordinates represent certified measured ground truth.
-            status: 'calibrated' | 'illustrative' | 'uncalibrated' | 'invalid'
-            provenance: descriptive source of calibration data
-            validation_message: diagnostic explanation of calibration state
+            status: legacy string status field (kept for backward compatibility).
+            provenance: descriptive source of calibration data.
+            validation_message: diagnostic explanation of calibration state.
+            calibration_status: formal CalibrationStatus enum. When provided, takes
+                precedence over the legacy ``status`` string.
         """
         self.source = np.asarray(source, dtype=np.float32)
         self.target = np.asarray(target, dtype=np.float32)
@@ -49,15 +168,31 @@ class PerspectiveTransformer:
         if not valid:
             self.is_calibrated = False
             self.status = "invalid"
+            self.calibration_status = CalibrationStatus.UNCALIBRATED
             self.validation_message = msg
             self.provenance = provenance
             # Fall back to identity-like safe transform
             self.m = np.eye(3, dtype=np.float32)
         else:
-            self.is_calibrated = bool(is_calibrated)
-            self.status = status if status in ("calibrated", "illustrative", "uncalibrated") else "illustrative"
+            # Resolve formal enum status
+            if calibration_status is not None:
+                self.calibration_status = calibration_status
+            else:
+                # Derive from legacy fields for backward compatibility
+                self.calibration_status = _resolve_calibration_status_from_legacy(
+                    is_calibrated=bool(is_calibrated),
+                    status_str=status,
+                    provenance=provenance,
+                )
+            self.is_calibrated = self.calibration_status in (
+                CalibrationStatus.USER_ATTESTED,
+                CalibrationStatus.VERIFIED,
+            )
+            self.status = self.calibration_status.value
             self.provenance = provenance
-            self.validation_message = validation_message if is_calibrated else (msg if not is_calibrated else "Valid geometry")
+            self.validation_message = validation_message if self.is_calibrated else (
+                msg if not self.is_calibrated else "Valid geometry"
+            )
             self.m = cv2.getPerspectiveTransform(self.source, self.target)
 
         # Calculate real-world bounding dimensions
@@ -115,9 +250,20 @@ class PerspectiveTransformer:
     @classmethod
     def validate_calibration_dict(cls, data: dict) -> Tuple[bool, str, Dict]:
         """
-        Inspects calibration dictionary from JSON upload.
-        Guarantees that an uploaded file cannot claim genuine ground truth
-        if it lacks provenance or fails geometric sanity.
+        Inspects calibration dictionary from JSON upload and returns a formal CalibrationStatus.
+
+        Enforcement rules (in priority order):
+        1. Geometry must be valid (finite, non-degenerate, realistic dimensions).
+        2. Provenance and status fields must come from the strict allowlists.
+        3. ``is_calibrated=true`` + illustrative/sample provenance → demoted to ILLUSTRATIVE.
+        4. ``is_calibrated=true`` + unknown provenance → rejected with a clear error.
+        5. ``is_calibrated=true`` + missing provenance → rejected with a clear error.
+        6. ``status='verified'`` in JSON → rejected; cannot be self-asserted.
+        7. ``is_calibrated=true`` + recognised user provenance → USER_ATTESTED (not VERIFIED).
+
+        Returns:
+            (ok: bool, message: str, validated_info: dict)
+            validated_info contains ``calibration_status`` (CalibrationStatus enum).
         """
         if not isinstance(data, dict):
             return False, "Calibration JSON root must be an object", {}
@@ -136,33 +282,40 @@ class PerspectiveTransformer:
             return False, f"Geometry validation failed: {geom_msg}", {}
 
         raw_calibrated = bool(data.get("is_calibrated", False))
-        provenance = str(data.get("provenance", "unknown_upload")).lower()
-        status = str(data.get("status", "")).lower()
+        raw_provenance = str(data.get("provenance", "unknown_upload"))
+        raw_status = str(data.get("status", ""))
 
-        # Integrity gate: if explicitly marked sample / illustrative / synthetic, refuse calibrated claim
-        is_sample_or_illustrative = (
-            "sample" in provenance
-            or "illustrative" in provenance
-            or "example" in provenance
-            or status in ("illustrative", "uncalibrated")
-            or not raw_calibrated
+        # Apply the strict 4-state provenance resolution
+        try:
+            cal_status = _resolve_calibration_status(
+                raw_is_calibrated=raw_calibrated,
+                provenance=raw_provenance,
+                json_status=raw_status,
+            )
+        except ValueError as e:
+            return False, str(e), {}
+
+        final_is_calibrated = cal_status in (
+            CalibrationStatus.USER_ATTESTED,
+            CalibrationStatus.VERIFIED,
         )
 
-        if is_sample_or_illustrative:
-            final_is_calibrated = False
-            final_status = "illustrative"
+        if cal_status == CalibrationStatus.ILLUSTRATIVE:
             validation_msg = "Illustrative example calibration (approximate speeds, unverified physical scale)"
+        elif cal_status == CalibrationStatus.UNCALIBRATED:
+            validation_msg = "Uncalibrated — speed estimation unavailable"
+        elif cal_status == CalibrationStatus.USER_ATTESTED:
+            validation_msg = "User-attested calibration: measurements supplied by operator (not independently verified)"
         else:
-            final_is_calibrated = True
-            final_status = "calibrated"
-            validation_msg = "Genuine measured calibration validated"
+            validation_msg = "Verified calibration"
 
         validated_info = {
             "source": source,
             "target": target,
             "is_calibrated": final_is_calibrated,
-            "status": final_status,
-            "provenance": data.get("provenance", "user_measured"),
+            "status": cal_status.value,
+            "calibration_status": cal_status,
+            "provenance": raw_provenance,
             "validation_message": validation_msg,
             "description": data.get("description", ""),
         }
@@ -179,11 +332,12 @@ class PerspectiveTransformer:
     def to_json(self, path: str) -> None:
         """Save this calibration so it can be reloaded for the same
         camera/video without re-clicking points."""
+        cs = getattr(self, "calibration_status", None)
         data = {
             "source_points": self.source.tolist(),
             "target_points_meters": self.target.tolist(),
             "is_calibrated": self.is_calibrated,
-            "status": self.status,
+            "status": cs.value if isinstance(cs, CalibrationStatus) else self.status,
             "provenance": self.provenance,
             "validation_message": self.validation_message,
         }
@@ -198,6 +352,7 @@ class PerspectiveTransformer:
             # Fall back to uncalibrated example with validation error explanation
             fallback = example_calibration()
             fallback.status = "invalid"
+            fallback.calibration_status = CalibrationStatus.UNCALIBRATED
             fallback.validation_message = msg
             return fallback
 
@@ -208,13 +363,14 @@ class PerspectiveTransformer:
             status=validated["status"],
             provenance=validated["provenance"],
             validation_message=validated["validation_message"],
+            calibration_status=validated.get("calibration_status"),
         )
 
 
 def example_calibration() -> PerspectiveTransformer:
     """
     Placeholder illustrative calibration for a 960x540 UA-DETRAC-style frame.
-    Explicitly marked with is_calibrated=False and status='illustrative' so the
+    Explicitly marked with is_calibrated=False and calibration_status=ILLUSTRATIVE so the
     system clearly informs operators that speed numbers are illustrative approximations.
     """
     source = np.array([
@@ -235,7 +391,7 @@ def example_calibration() -> PerspectiveTransformer:
         target,
         is_calibrated=False,
         status="illustrative",
-        
         provenance="illustrative_example",
         validation_message="Default illustrative perspective geometry (unverified scale; speeds are approximate)",
+        calibration_status=CalibrationStatus.ILLUSTRATIVE,
     )

@@ -45,10 +45,22 @@ def load_transformer(calibration_path: Optional[str]) -> Tuple[PerspectiveTransf
 
     transformer = PerspectiveTransformer.from_json(calibration_path)
     if not transformer.is_calibrated:
+        cs_label = getattr(transformer, 'calibration_status', None)
+        cs_str = cs_label.value if cs_label is not None else transformer.status
         warning = (
-            f"Calibration is illustrative/unverified ({transformer.provenance}): "
-            f"{transformer.validation_message}. Speed numbers are approximate."
+            f"Calibration status: {cs_str.upper()} — ({transformer.provenance}): "
+            f"{transformer.validation_message}. Speed numbers are approximate only."
         )
+    elif getattr(transformer, 'calibration_status', None) is not None:
+        from src.perspective import CalibrationStatus
+        cs = transformer.calibration_status
+        if cs == CalibrationStatus.USER_ATTESTED:
+            warning = (
+                "Speed: user-attested calibration in use. "
+                "Measurements were supplied by the operator and have NOT been independently verified."
+            )
+        else:
+            warning = None
     else:
         warning = None
     return transformer, warning

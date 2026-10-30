@@ -69,7 +69,8 @@ def _validate_and_save_calibration(calibration: Optional[UploadFile]) -> Optiona
 
     valid, msg, _ = PerspectiveTransformer.validate_calibration_dict(calib_data)
     if not valid:
-        raise HTTPException(status_code=400, detail=f"Invalid calibration JSON: {msg}")
+        # Surface the exact rejection reason (geometry, unknown provenance, forged verified, etc.)
+        raise HTTPException(status_code=400, detail=msg)
 
     with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp_cal:
         tmp_cal.write(calib_bytes)

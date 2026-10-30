@@ -475,6 +475,37 @@ pytest tests/ -v
 
 ## Calibration — getting real speed numbers
 
+### Calibration Trust Levels (Formal 4-State System)
+
+TrafficVision enforces a strict **4-state calibration provenance system**. Every speed value is tagged with one of these states — you cannot accidentally present unverified estimates as ground truth:
+
+| State | `calibration_status` | `is_calibrated` | Meaning |
+|---|---|---|---|
+| `ILLUSTRATIVE` | `illustrative` | `false` | Example / demo calibration. Speeds are **approximate only**. Never treated as ground truth. |
+| `UNCALIBRATED` | `uncalibrated` | `false` | No calibration provided. Speed estimation unavailable. |
+| `USER_ATTESTED` | `user_attested` | `true` | Operator has explicitly confirmed measurements from the real camera scene. Valid geometry required. **Not independently verified.** |
+| `VERIFIED` | `verified` | `true` | Reserved for future independent verification workflow. Cannot be self-asserted via JSON. |
+
+> [!IMPORTANT]
+> The bundled `data/sample_calibration.json` is **always** treated as `ILLUSTRATIVE` regardless of any `is_calibrated` flag it may contain.
+> User-uploaded calibration files with unknown provenance strings or a forged `status: "verified"` field are **rejected** by the API with HTTP 400.
+
+**Accepted provenance values:**
+- Illustrative: `illustrative_sample`, `example`, `demo`, `placeholder`, `synthetic_test`
+- User-Attested: `user_measured`, `field_survey_measured`, `measured_user`, `user_attested`
+
+To supply a **user-attested** calibration via the API:
+```json
+{
+  "source_points": [[x1,y1],[x2,y2],[x3,y3],[x4,y4]],
+  "target_points_meters": [[0,0],[w,0],[w,l],[0,l]],
+  "is_calibrated": true,
+  "provenance": "user_measured",
+  "status": "calibrated",
+  "description": "Lane width 3.5m, distance between markings 25m"
+}
+```
+
 Pixel movement between frames means nothing in km/h until the code knows
 how many real-world meters one pixel represents in your specific
 video/camera angle. There's no way to derive this automatically from
@@ -516,13 +547,7 @@ curl -X POST http://localhost:8000/analyze \
   -F "calibration=@calibration.json"
 ```
 
-**If you omit `--calibration`**, or supply the bundled sample calibration, the pipeline falls back to an illustrative sample calibration (`src/perspective.py`'s `example_calibration()`, `is_calibrated: false`, `status: illustrative`) and prints a clear warning — those speed numbers are unverified approximations, useful only for testing pipeline mechanics. The API's `/analyze` response includes `calibration_used: false`, `calibration_status: illustrative`, and an explicit `speed_warning`. Only genuinely measured calibrations (`tools/calibrate.py`) carry `is_calibrated: true`.
-calibration (`src/perspective.py`'s `example_calibration()`) and prints a
-loud warning — those speed numbers are not real, only useful for testing
-the pipeline mechanics. The API's `/analyze` response also includes a
-`calibration_used` flag and `speed_warning` field so callers can't
-mistake placeholder numbers for real ones. Document whichever you used
-explicitly in any writeup — it's the honest caveat on the speed numbers.
+**If you omit `--calibration`**, or supply the bundled sample calibration, the pipeline falls back to an illustrative sample calibration (`src/perspective.py`'s `example_calibration()`, `is_calibrated: false`, `status: illustrative`) and prints a clear warning — those speed numbers are unverified approximations, useful only for testing pipeline mechanics. The API's `/analyze` response includes `calibration_used: false`, `calibration_status: illustrative`, and an explicit `speed_warning`. Only genuinely measured calibrations (`tools/calibrate.py`) carry `is_calibrated: true` with valid `user_attested` provenance.
 
 **End-to-end validation:** the full pipeline (detection + tracking +
 speed + counting) was run against the actual final checkpoint
@@ -553,6 +578,42 @@ seen enough examples, while `van` and `others` are visually more varied
 and ambiguous despite `van` having far more training instances. Don't
 assume instance count alone determines which classes need attention —
 check per-class metrics directly.
+
+
+## ⚡ System Performance & Benchmark Metrics
+
+Benchmarked on **Intel Core i5-1334U (10 cores, 1.30–4.60 GHz), 16 GB RAM, Windows 11 (CPU-only)**:
+
+| Workload | Hardware | Resolution | Frame Skip | Processing Time | Throughput |
+|---|---|---|---|---|---|
+| Full Pipeline (51 frames) | CPU (x86_64) | 700×394 | `frame_skip=1` | 91.11s | ~0.56 FPS |
+| Accelerated Pipeline (51 frames) | CPU (x86_64) | 700×394 | `frame_skip=2` | 42.15s | ~1.21 FPS |
+| CUDA Inference (Estimated) | NVIDIA RTX 3060+ | 1080p | `frame_skip=1` | ~1.8s | ~28–35 FPS |
+
+### Comprehensive Automated Test Coverage
+
+The repository maintains an automated test suite comprising **87 tests** across three layers:
+- **Unit & Logic Tests (`tests/test_pipeline.py`) — 61 Tests**: Verification of the formal 4-state calibration provenance system, perspective homography geometry, frame-index elapsed-time ($dt$) mathematics, speed outlier rejection (>200 km/h), track discontinuity handling, multi-signal congestion scoring, and incident deduplication.
+- **FastAPI Endpoint Tests (`tests/test_api.py`) — 11 Tests**: Validation of HTTP request handling, file upload limits (300 MB), parameter ranges, corrupt/degenerate calibration geometry rejection, and temporary file background cleanup.
+- **Real Integration Tests (`tests/test_api_real_integration.py`) — 15 Tests**: End-to-end un-mocked pipeline tests executing full video processing against `data/sample_traffic.mp4`, verifying response schemas, multi-format export, and provenance enforcement.
+- **Browser UI Automation (`scripts/browser_test.py`)**: Playwright automation testing with Microsoft Edge verifying all 5 Streamlit tabs with full-page visual captures.
+
+---
+
+## ⚠️ Known Limitations & Technical Assumptions
+
+1. **Planar Ground-Plane Assumption (Homography)**:
+   - Perspective transformation assumes a flat, planar roadway surface within the 4-point ROI polygon. Roads with significant vertical curves, crests, or grade changes will introduce non-linear geometric distortions in projected meter distances.
+2. **Camera Rigidity & Sensor Vibration**:
+   - The homography matrix $H$ is computed once per camera mount. Severe camera vibration, mast sway, or PTZ camera re-orientation will invalidate calibration geometry until re-calibrated.
+3. **Severe Visual Occlusion**:
+   - In dense bumper-to-bumper congestion, high-profile vehicles (trucks, buses) can visually occlude smaller passenger cars and motorcycles. ByteTrack maintains track histories for up to 30 dropped frames, but sustained occlusions exceeding 1.5 seconds reset track history to prevent false velocity spikes.
+4. **Heuristic Incident Flagging**:
+   - Incident detection algorithms (stationary vehicles, sudden deceleration, wrong-way movement) use explainable rule-based heuristics. They serve as situational alerts for human traffic operators and do not constitute legal collision determinations.
+5. **CPU Throughput vs. GPU Real-Time Execution**:
+   - Running deep learning inference (YOLO11) on CPU delivers ~0.6–1.2 FPS. For real-time 30 FPS surveillance, CUDA-compatible GPU acceleration or TensorRT optimization is required.
+
+---
 
 ## License
 

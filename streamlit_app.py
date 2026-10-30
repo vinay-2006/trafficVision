@@ -65,6 +65,8 @@ if "annotated_video_path" not in st.session_state:
     st.session_state.annotated_video_path = None
 if "processing_done" not in st.session_state:
     st.session_state.processing_done = False
+if "video_path_to_process" not in st.session_state:
+    st.session_state.video_path_to_process = None
 
 
 # Sidebar Configuration
@@ -118,15 +120,17 @@ with col_src2:
     sample_available = Path("data/sample_traffic.mp4").exists()
     use_sample = st.button("Load Built-in Sample Video", disabled=not sample_available)
 
-video_path_to_process = None
 if uploaded_video is not None:
     t_vid = tempfile.NamedTemporaryFile(suffix=Path(uploaded_video.name).suffix, delete=False)
     t_vid.write(uploaded_video.read())
     t_vid.close()
-    video_path_to_process = t_vid.name
+    st.session_state.video_path_to_process = t_vid.name
 elif use_sample and sample_available:
-    video_path_to_process = "data/sample_traffic.mp4"
-    st.info("Loaded `data/sample_traffic.mp4`.")
+    st.session_state.video_path_to_process = "data/sample_traffic.mp4"
+
+video_path_to_process = st.session_state.video_path_to_process
+if video_path_to_process and Path(video_path_to_process).exists():
+    st.info(f"Loaded `{Path(video_path_to_process).name}` for analysis.")
 
 
 # Processing Trigger
@@ -216,13 +220,16 @@ if st.session_state.processing_done and st.session_state.pipeline_result:
             </div>
             """, unsafe_allow_html=True)
         with kpi3:
-            calib_status = spd.get('calibration_status', 'illustrative' if not spd['is_calibrated'] else 'calibrated')
-            if spd['is_calibrated']:
-                calib_badge = '<span class="badge-calib">CALIBRATED</span>'
-            elif calib_status == 'illustrative':
-                calib_badge = '<span class="badge-uncalib">ILLUSTRATIVE SAMPLE</span>'
-            else:
-                calib_badge = '<span class="badge-uncalib">UNCALIBRATED</span>'
+            calib_status = spd.get('calibration_status', 'illustrative')
+            # Map formal 4-state CalibrationStatus to human-readable dashboard badge
+            _CALIB_BADGE_MAP = {
+                'user_attested': '<span class="badge-calib">USER-ATTESTED</span>',
+                'verified':      '<span class="badge-calib">VERIFIED</span>',
+                'illustrative':  '<span class="badge-uncalib">ILLUSTRATIVE SAMPLE</span>',
+                'uncalibrated':  '<span class="badge-uncalib">UNCALIBRATED</span>',
+                'calibrated':    '<span class="badge-calib">USER-ATTESTED</span>',  # legacy
+            }
+            calib_badge = _CALIB_BADGE_MAP.get(calib_status, '<span class="badge-uncalib">UNCALIBRATED</span>')
 
             st.markdown(f"""
             <div class="metric-card">
@@ -263,7 +270,7 @@ if st.session_state.processing_done and st.session_state.pipeline_result:
         if spd.get("speed_warning"):
             st.warning(f"⚠️ **Speed Calibration Notice**: {spd['speed_warning']}")
         elif not spd["is_calibrated"]:
-            st.warning("⚠️ Speed values are derived from approximate pixel scaling. Provide a real 4-point measurement via `tools/calibrate.py` to obtain certified ground-truth speed.")
+            st.warning("⚠️ Speed values are derived from approximate pixel scaling. Provide a real 4-point measurement via `tools/calibrate.py` with valid provenance to obtain user-attested speed estimates.")
 
         # Quick breakdown charts
         ch_col1, ch_col2 = st.columns(2)
